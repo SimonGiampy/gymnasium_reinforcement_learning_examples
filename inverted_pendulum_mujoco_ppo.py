@@ -38,7 +38,7 @@ from tqdm import tqdm
 
 # pytorch imports
 import torch
-from tensordict.nn import TensorDictModule
+from tensordict.nn import TensorDictModule, TensorDictSequential
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import nn
 
@@ -52,6 +52,7 @@ from torchrl.envs import (
     Compose,
     DoubleToFloat,
     ObservationNorm,
+    ObservationTransform,
     StepCounter,
     TransformedEnv,
 )
@@ -70,8 +71,8 @@ print("Using device:", device)
 
 ######################################################################
 # PPO-clip parameters
-
-sub_batch_size = 64  # cardinality of the sub-samples gathered from the current data in the inner loop
+max_steps = 1000  # max steps per episode
+sub_batch_size = 128  # cardinality of the sub-samples gathered from the current data in the inner loop
 num_epochs = 10  # optimization steps per batch of data collected
 CLIP_EPSILON = (
     0.2  # clip value for PPO loss: see the equation in the intro for more context.
@@ -93,20 +94,20 @@ base_env = GymEnv("InvertedDoublePendulum-v4", device=device)
 # - normalize observations
 # - convert all double tensors to float tensors
 # - add a step counter to keep track of episode lengths before termination
-norm_transform = ObservationNorm(in_keys=["observation"])
+norm_transform = ObservationNorm(in_keys=["observation"], out_keys=["obs_norm"])
 
 # create the transformed environment via a composition of transforms
 env = TransformedEnv(
     base_env=base_env,
     transform=Compose( # a sequence of transforms to apply
         norm_transform, # normalize observations
-        DoubleToFloat(), # convert all double tensors to float tensors
-        StepCounter(), # count the steps taken in each episode before termination
+        DoubleToFloat(in_keys=["obs_norm"], out_keys=["obs_float"]), # convert all double tensors to float tensors
+        StepCounter(max_steps=max_steps), # count the steps taken in each episode before termination
     ),
 )
 
 # initialize mu, sigma for parent environment's observation spec
-norm_transform.init_stats(num_iter=1000, # number of iterations to run for normalization statistics computation
+norm_transform.init_stats(num_iter=max_steps, # number of iterations to run for normalization statistics computation
                           reduce_dim=0, cat_dim=0) # dimension axis to reduce and concatenate on (batch axis)
 
 
@@ -162,7 +163,7 @@ print("Number of parameters in the policy network:", num_policy_params)
 # wrap the network in a TensorDictModule to specify input and output keys
 policy_module = TensorDictModule(
     module=actor_network,
-    in_keys=["observation"], # observations as input (state)
+    in_keys=["obs_float"], # observations as input (state)
     out_keys=["loc", "scale"] # mu, sigma for the TanhNormal distribution
 )
 
@@ -171,6 +172,7 @@ probabilistic_actor_policy = ProbabilisticActor(
     module=policy_module,
     spec=env.action_spec, # action specs from the environment
     in_keys=["loc", "scale"], # read mu, sigma distribution parameters from these keys
+    out_keys=["action"], # output sampled actions to this key
     distribution_class=TanhNormal, # apply a TanhNormal distribution for bounded actions
     distribution_kwargs={ # specify action bounds (min, max)
         "low": env.action_spec_unbatched.space.low,
@@ -200,12 +202,12 @@ value_network = nn.Sequential(
 # wrap the value network in a TensorDictModule
 value_module = TensorDictModule(
     module=value_network,
-    in_keys=["observation"],
+    in_keys=["obs_float"],
     out_keys=["state_value"],
 )
 
-print("Running policy:", probabilistic_actor_policy(env.reset()))
-print("Running value:", value_module(env.reset()))
+print("Running policy actor module:", probabilistic_actor_policy(env.reset()))
+print("Running value critic module:", value_module(env.reset()))
 
 ######################################################################
 # 
@@ -216,14 +218,16 @@ print("Running value:", value_module(env.reset()))
 # Data collection parameters
 
 # frames per batch = number of environment steps per data collection batch
-frames_per_batch = 1000
+frames_per_batch = 1024
 
 # total frames = total number of environment steps for the whole training
-total_frames = 10_000
+total_frames = 1024 * 10
 
+# data collector to gather data from the environment using the current policy
+# synchronous collector: collects data in the main thread
 collector = SyncDataCollector(
-    create_env_fn=env,
-    policy=probabilistic_actor_policy,
+    create_env_fn=env, # environment to collect data from
+    policy=probabilistic_actor_policy, # current policy to use for data collection
     frames_per_batch=frames_per_batch,
     total_frames=total_frames,
     split_trajs=False,
@@ -259,35 +263,39 @@ advantage_module = GAE(
 
 # PPO loss module -- implements the PPO-clip loss function and computes
 # the various loss terms (policy objective, value function loss, entropy bonus)
+# refer to the docs: https://docs.pytorch.org/rl/main/reference/generated/torchrl.objectives.ClipPPOLoss.html
 loss_module = ClipPPOLoss(
     actor_network=probabilistic_actor_policy, # policy (actor) network
     critic_network=value_module, # value (critic) network
     clip_epsilon=CLIP_EPSILON, # clip parameter for PPO loss
-    entropy_bonus=bool(ENTROPY_EPS), 
-    entropy_coeff=ENTROPY_EPS,
-    # these keys match by default but we set this for completeness
-    critic_coeff=1.0,
+    reduction="mean", # average the loss over the batch
+    entropy_bonus=True, # include an entropy bonus to encourage exploration
+    entropy_coeff=ENTROPY_EPS, # coefficient for the entropy bonus
+    critic_coeff=1.0, # coefficient for the value function loss
     loss_critic_type="smooth_l1", # Huber loss for value function loss
 )
 
-lr = 3e-4
+lr = 1e-3 # starting learning rate for the optimizer
 max_grad_norm = 1.0
 optim = torch.optim.Adam(
     params=loss_module.parameters(), 
     lr=lr
 )
 
+# compute the number of batches for the collector
+max_scheduler_steps = total_frames // frames_per_batch
+print("Total batches of data sampled from the collector:", max_scheduler_steps)
+
+sub_batch_frames = frames_per_batch // sub_batch_size
+print("Number of sub-batches per batch of data collected:", sub_batch_frames)
+
 # learning rate scheduler: cosine annealing over the total number of frames
 # the learning rate will decrease from the initial value to 0 over training
 # it follows a half-cosine curve from initial value to 0
-
-# compute the number of scheduler update steps over the whole training
-max_scheduler_steps = total_frames // frames_per_batch
-print("Total scheduler steps:", max_scheduler_steps)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer=optim, 
     T_max=max_scheduler_steps, # number of steps for a full cosine annealing cycle
-    eta_min=0.0 # minimum learning rate at the end of training
+    eta_min=5e-5 # minimum learning rate at the end of training
 )
 
 ######################################################################
@@ -295,90 +303,152 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 # Training loop
 # -------------
 
-logs = defaultdict(list)
-pbar = tqdm(total=total_frames)
-eval_str = ""
+def log_stats(batch_i, tensordict_data):
+    train_reward = tensordict_data["next", "reward"].mean().item()
+    steps   = tensordict_data["step_count"].max().item()
+    current_lr  = optim.param_groups[0]["lr"]
 
-# We iterate over the collector until it reaches the total number of frames it was
-# designed to collect:
+    cum_reward_str = f" average reward={train_reward: 4.4f}"
+    stepcount_str = f" max step-count={steps}"
+    lr_str = f" lr={current_lr: 4.4f}"
+    
+    print(f"epoch {batch_i}:" + cum_reward_str + "," + stepcount_str + "," + lr_str)
+    
+def log_eval_stats(batch_i, eval_rollout):
+    eval_reward_mean = eval_rollout["next", "reward"].mean().item()
+    eval_reward_sum = eval_rollout["next", "reward"].sum().item()
+    steps = eval_rollout["step_count"].max().item()
+
+    mean_reward_str = f" eval mean reward={eval_reward_mean: 4.4f}"
+    cum_reward_str = f" eval cum reward={eval_reward_sum: 4.4f}"
+    stepcount_str = f" eval max step-count={steps}"
+
+    print(f"eval epoch {batch_i}:" + mean_reward_str + "," + cum_reward_str + "," + stepcount_str)
+    
+def train_sub_batch():
+    # inner loop: iterate over sub-batches sampled from the replay buffer
+    for _ in range(sub_batch_frames):
+        # sample a sub-batch from the replay buffer
+        subdata = replay_buffer.sample(sub_batch_size)
+        
+        # compute the PPO loss values for the current sub-batch
+        loss_vals = loss_module(subdata.to(device))
+        
+        # total loss is the sum of the individual loss terms
+        loss_value = (
+            loss_vals["loss_objective"] # clip ppo loss of actor policy network
+            + loss_vals["loss_critic"] # value function loss of critic value network
+            + loss_vals["loss_entropy"] # entropy bonus loss to encourage exploration
+        )
+
+        # Optimization: backward, gradient clipping and optimization step
+        loss_value.backward()
+        
+        # keep gradients from exploding by clipping them to a maximum norm
+        torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
+        
+        # perform optimization step: update networks parameters
+        optim.step()
+        optim.zero_grad() # reset gradients for the next step
+        
+def eval_policy(batch_i):
+    # evaluation rollout: run the policy in deterministic mode with pure exploitation
+    # exploit: take the expected value of the action distribution for a given
+    # number of steps
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        # execute a rollout with the trained policy for max_steps
+        eval_rollout = env.rollout(max_steps, policy=probabilistic_actor_policy)
+        log_eval_stats(batch_i, eval_rollout)
+        del eval_rollout
+
+class ObsNormFloat32(nn.Module):
+    def __init__(self, loc, scale):
+        super().__init__()
+        # Use clone().detach() to ensure storage is allocated and independent
+        self.register_buffer("loc", loc)
+        self.register_buffer("scale", scale)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        # Arithmetic in float64
+        obs_norm = (obs - self.loc) / (self.scale + 1e-8)
+        # Cast to float32 for the MLP
+        return obs_norm.to(torch.float32)
+
+
+def export_policy():
+    # transform the policy to include the environment's preprocessing transforms
+    # this allows to export a single module that takes raw observations as input
+    # and outputs actions directly, without needing to apply the transforms separately
+    
+    # get normalization constants from the environment's observation normalization transform
+    norm_loc, norm_scale = env.transform[0].loc.clone(), env.transform[0].scale.clone()
+    print("Normalization loc:", norm_loc)
+    print("Normalization scale:", norm_scale)
+    # create a new observation normalization transform using the constants
+    norm_float32_module = TensorDictModule(
+        module=ObsNormFloat32(loc=norm_loc, scale=norm_scale),
+        in_keys=["observation"],
+        out_keys=["obs_float"]
+    )
+    
+    policy_transform = TensorDictSequential(
+        norm_float32_module,
+        probabilistic_actor_policy.requires_grad_(False),
+    )
+    policy_transform.select_out_keys("action")
+    print("Policy transform input keys:", policy_transform.in_keys)
+    print("Policy transform output keys:", policy_transform.out_keys)
+    
+    # if the policy improved during evaluation, save the policy network module
+    fake_td = env.base_env.fake_tensordict()
+    obs = fake_td["observation"].to(device)
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        exported_policy = torch.export.export(
+            policy_transform,
+            args=(),
+            kwargs={"observation": obs},
+            strict=False,
+        )
+        
+        print("Deterministic policy")
+        exported_policy.graph_module.print_readable()
+        
+        output = exported_policy.module()(observation=obs)
+        print("Exported module output with fake observation input:", output)
+        
+        # save the exported policy module to a file
+        torch.export.save(exported_policy, "inverted_pendulum_ppo_policy.pt2")
+        
+export_policy()
+
+probabilistic_actor_policy.requires_grad_(True)
+# iteration over the collector allows to get batches of data from the environment
 for i, tensordict_data in enumerate(collector):
-    # we now have a batch of data to work with. Let's learn something from it.
+    # iterate for a number of epochs for each batch of data collected
     for _ in range(num_epochs):
-        # We'll need an "advantage" signal to make PPO work.
-        # We re-compute it at each epoch as its value depends on the value
-        # network which is updated in the inner loop.
-        advantage_module(tensordict_data)
+        
+        # compute advantage value using the GAE module estimator 
+        # the advantage value is recomputed at each epoch since it depends on the policy
+        # network which is updated in the inner loop
+        advantage_module(tensordict_data) # computes advantages and adds them to tensordict_data
+        
+        # store the collected data in the replay buffer
         data_view = tensordict_data.reshape(-1)
         replay_buffer.extend(data_view.cpu())
-        for _ in range(frames_per_batch // sub_batch_size):
-            subdata = replay_buffer.sample(sub_batch_size)
-            loss_vals = loss_module(subdata.to(device))
-            loss_value = (
-                loss_vals["loss_objective"]
-                + loss_vals["loss_critic"]
-                + loss_vals["loss_entropy"]
-            )
+        
+        # train on sub-batches sampled from the replay buffer
+        train_sub_batch()
 
-            # Optimization: backward, grad clipping and optimization step
-            loss_value.backward()
-            # this is not strictly mandatory but it's good practice to keep
-            # your gradient norm bounded
-            torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
-            optim.step()
-            optim.zero_grad()
-
-    logs["reward"].append(tensordict_data["next", "reward"].mean().item())
-    pbar.update(tensordict_data.numel())
-    cum_reward_str = (
-        f"average reward={logs['reward'][-1]: 4.4f} (init={logs['reward'][0]: 4.4f})"
-    )
-    logs["step_count"].append(tensordict_data["step_count"].max().item())
-    stepcount_str = f"step count (max): {logs['step_count'][-1]}"
-    logs["lr"].append(optim.param_groups[0]["lr"])
-    lr_str = f"lr policy: {logs['lr'][-1]: 4.4f}"
+    log_stats(i, tensordict_data)
+    
+    # policy evaluation every 10 batches of data collected
     if i % 10 == 0:
-        # We evaluate the policy once every 10 batches of data.
-        # Evaluation is rather simple: execute the policy without exploration
-        # (take the expected value of the action distribution) for a given
-        # number of steps (1000, which is our ``env`` horizon).
-        # The ``rollout`` method of the ``env`` can take a policy as argument:
-        # it will then execute this policy at each step.
-        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-            # execute a rollout with the trained policy
-            eval_rollout = env.rollout(1000, policy=probabilistic_actor_policy)
-            logs["eval reward"].append(eval_rollout["next", "reward"].mean().item())
-            logs["eval reward (sum)"].append(
-                eval_rollout["next", "reward"].sum().item()
-            )
-            logs["eval step_count"].append(eval_rollout["step_count"].max().item())
-            eval_str = (
-                f"eval cumulative reward: {logs['eval reward (sum)'][-1]: 4.4f} "
-                f"(init: {logs['eval reward (sum)'][0]: 4.4f}), "
-                f"eval step-count: {logs['eval step_count'][-1]}"
-            )
-            del eval_rollout
-    pbar.set_description(", ".join([eval_str, cum_reward_str, stepcount_str, lr_str]))
+        eval_policy(i)
 
-    # We're also using a learning rate scheduler. Like the gradient clipping,
-    # this is a nice-to-have but nothing necessary for PPO to work.
+    # update the learning rate according to the scheduler after each batch
     scheduler.step()
 
-######################################################################
-#
-# Results
-# -------
+# final evaluation after training is complete
+eval_policy(-1)
 
-plt.figure(figsize=(10, 10))
-plt.subplot(2, 2, 1)
-plt.plot(logs["reward"])
-plt.title("training rewards (average)")
-plt.subplot(2, 2, 2)
-plt.plot(logs["step_count"])
-plt.title("Max step count (training)")
-plt.subplot(2, 2, 3)
-plt.plot(logs["eval reward (sum)"])
-plt.title("Return (test)")
-plt.subplot(2, 2, 4)
-plt.plot(logs["eval step_count"])
-plt.title("Max step count (test)")
-plt.show()
+export_policy()
