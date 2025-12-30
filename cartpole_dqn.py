@@ -3,6 +3,8 @@ Example of Deep Q-Network (DQN) implementation using PyTorch and Gymnasium's Car
 
 Implementation derived from: https://docs.pytorch.org/tutorials/intermediate/reinforcement_q_learning.html
 
+CartPole-v1 environment details: https://gymnasium.farama.org/environments/classic_control/cart_pole/
+
 Install the Gymnasium Environment package with:
 
 ```bash
