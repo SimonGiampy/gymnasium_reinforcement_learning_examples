@@ -52,11 +52,10 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
-from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
+from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type, step_mdp
 from torchrl.modules import ProbabilisticActor, TanhNormal
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
-
 
 # set device
 device = (
@@ -67,6 +66,9 @@ device = (
 print("Using device:", device)
 
 ######################################################################
+# Hyperparameters
+# -------------------
+
 # PPO-clip parameters
 max_steps = 1000  # max steps per episode
 sub_batch_size = 128  # cardinality of the sub-samples gathered from the current data in the inner loop
@@ -77,10 +79,35 @@ CLIP_EPSILON = (
 GAMMA = 0.99
 LAMBDA = 0.95
 ENTROPY_EPS = 1e-4
+NORM_EPS = 1e-6 # observation norm scale epsilon
+
+# Data collection parameters
+
+# frames per batch = number of environment steps per data collection batch
+frames_per_batch = 1024
+
+# total frames = total number of environment steps for the whole training
+total_frames = 1024 * 100
 
 ######################################################################
-# Environment definition: use Gymnasium's InvertedDoublePendulum-v4
+# Environment definition: use Gymnasium's InvertedDoublePendulum-v5
 # defined using the TorchRL GymEnv wrapper for compatibility.
+
+class ObsNormFloat32(nn.Module):
+    def __init__(self, loc: torch.Tensor, scale: torch.Tensor):
+        super().__init__()
+        # input tensors must be allocated, or cloned from the original values
+        # allocate class object variables
+        # input data must be of dtype float64
+        self.register_buffer("loc", loc)
+        self.register_buffer("scale", scale)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        # Arithmetic in float64
+        self.scale.clamp_min(NORM_EPS)  # avoid division by zero
+        obs_norm = (obs - self.loc) / self.scale
+        # Cast to float32 for the MLP
+        return obs_norm.to(torch.float32)
 
 
 def init_env():
@@ -88,13 +115,14 @@ def init_env():
     print("list of available Gymnasium environments:", GymEnv.available_envs)
 
     # initialize the base environment
-    base_env = GymEnv("InvertedDoublePendulum-v4", device=device)
+    base_env = GymEnv("InvertedDoublePendulum-v5", device=device)
 
     # apply a set of transforms to the base environment to:
     # - normalize observations
     # - convert all double tensors to float tensors
     # - add a step counter to keep track of episode lengths before termination
-    norm_transform = ObservationNorm(in_keys=["observation"], out_keys=["obs_norm"])
+    norm_transform = ObservationNorm(in_keys=["observation"], out_keys=["obs_norm"],
+                                     standard_normal=True, eps=NORM_EPS)
 
     # create the transformed environment via a composition of transforms
     env = TransformedEnv(
@@ -111,6 +139,8 @@ def init_env():
                               reduce_dim=0, cat_dim=0)  # dimension axis to reduce and concatenate on (batch axis)
 
     print("normalization constant shape:", norm_transform.loc.shape)
+    print("observation normalization loc:", norm_transform.loc)
+    print("observation normalization scale:", norm_transform.scale)
     print("observation_spec:", env.observation_spec["observation"])
     print("reward_spec:", env.reward_spec)
     print("action_spec:", env.action_spec)
@@ -122,10 +152,22 @@ def init_env():
     # sanity check with a dummy rollout
     check_env_specs(env)
 
-    # test a rollout of three steps, and check the shape of the resulting TensorDict
-    rollout = env.rollout(3)
-    # print("rollout of three steps:", rollout)
-    print("Shape of the rollout TensorDict:", rollout.batch_size)
+    return env
+
+def setup_env_rendered():
+    # initialize the base environment with rendering enabled
+    base_env = GymEnv("InvertedDoublePendulum-v5", device=device, render_mode="human")
+
+    # create the transformed environment via a composition of transforms
+    env = TransformedEnv(
+        base_env=base_env,
+        transform=Compose(  # a sequence of transforms to apply
+            StepCounter(max_steps=max_steps),  # count the steps taken in each episode before termination
+        ),
+    )
+    
+    # sanity check with a dummy rollout
+    check_env_specs(env)
 
     return env
 
@@ -134,11 +176,9 @@ def init_env():
 # ------
 #
 
-
 layer_neurons = 256  # number of neurons per linear layer
 
-
-def setup_policy(env):
+def create_actor_network(env):
     observation_space_num = env.observation_spec["observation"].shape[-1]
     action_space_num = env.action_spec.shape[-1]
 
@@ -161,7 +201,11 @@ def setup_policy(env):
         nn.Linear(layer_neurons, 2 * action_space_num, device=device),
         NormalParamExtractor(),
     )
-
+    
+    return actor_network
+    
+def setup_policy(env, actor_network):
+    
     # compute number of parameters in the policy network
     num_policy_params = sum(p.numel() for p in actor_network.parameters())
     print("Number of parameters in the policy network:", num_policy_params)
@@ -187,7 +231,7 @@ def setup_policy(env):
         return_log_prob=True,  # log-probabilities will be computed by the policy
     )
 
-    return probabilistic_actor_policy
+    return probabilistic_actor_policy.to(device)
 
 ######################################################################
 # Value network
@@ -221,22 +265,13 @@ def setup_value_module(env):
         out_keys=["state_value"],
     )
 
-    return value_module
+    return value_module.to(device)
 
 
 ######################################################################
 # Data collector
 # --------------
 #
-
-# Data collection parameters
-
-# frames per batch = number of environment steps per data collection batch
-frames_per_batch = 1024
-
-# total frames = total number of environment steps for the whole training
-total_frames = 1024 * 10
-
 
 def create_collector(env: GymEnv, actor_policy):
 
@@ -397,53 +432,12 @@ def eval_policy(batch_i, env, probabilistic_actor_policy):
         del eval_rollout
 
 
-class ObsNormFloat32(nn.Module):
-    def __init__(self, loc: torch.Tensor, scale: torch.Tensor):
-        super().__init__()
-        # input tensors must be allocated, or cloned from the original values
-        # allocate class object variables
-        # input data must be of dtype float64
-        self.register_buffer("loc", loc)
-        self.register_buffer("scale", scale)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        # Arithmetic in float64
-        obs_norm = (obs - self.loc) / (self.scale + 1e-8)
-        # Cast to float32 for the MLP
-        return obs_norm.to(torch.float32)
-
 ######################################################################
 # Exporting and Saving the trained policy for inference
 # -----------------------------------------------------
 
-
-def export_policy(env, probabilistic_actor_policy):
-    # transform the policy to include the environment's preprocessing transforms
-    # this allows to export a single module that takes raw observations as input
-    # and outputs actions directly, without needing to apply the transforms separately
-
-    # get normalization constants from the environment's observation normalization transform
-    norm_loc, norm_scale = env.transform[0].loc.clone(), env.transform[0].scale.clone()
-    print("Normalization loc:", norm_loc)
-    print("Normalization scale:", norm_scale)
-
-    # create a new observation normalization transform using the constants
-    norm_float32_module = TensorDictModule(
-        module=ObsNormFloat32(loc=norm_loc, scale=norm_scale),
-        in_keys=["observation"],
-        out_keys=["obs_float"]
-    )
-
-    # create tensordict from normalization and conversion trasform
-    policy_transform = TensorDictSequential(
-        norm_float32_module,
-        # probabilistic actor policy trained to be exported
-        probabilistic_actor_policy.requires_grad_(False),
-    )
-    policy_transform.select_out_keys("action")
-    print("Policy transform input keys:", policy_transform.in_keys)
-    print("Policy transform output keys:", policy_transform.out_keys)
-
+def export_policy(env, actor_policy):
+    
     # if the policy improved during evaluation, save the policy network module
 
     # generate fake tensordict = input data
@@ -454,24 +448,66 @@ def export_policy(env, probabilistic_actor_policy):
     # exploitation will take maximum value of mean probabilities
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         exported_policy = torch.export.export(
-            policy_transform,
+            actor_policy,
             args=(),
             kwargs={"observation": obs},
             strict=False,
         )
 
-        print("Deterministic policy graph module: ", exported_policy.graph_module.print_readable())
+        # print("Deterministic policy graph module: ", exported_policy.graph_module.print_readable())
 
         output = exported_policy.module()(observation=obs)
         print("Exported module output with fake observation input:", output)
 
         # save the exported policy module to a file
-        torch.export.save(exported_policy, "inverted_pendulum_ppo_policy.pt2")
+        torch.export.save(exported_policy, "models/inverted_pendulum_ppo_policy.pt2")
 
 
 def save_model_weights(probabilistic_actor_policy):
+    # save the model weights of the deep MLP model used as policy network
+    mlp_model = probabilistic_actor_policy.module[0].module
+    
     # save model weights only with state_dict
-    torch.save(probabilistic_actor_policy.state_dict(), "models/inverted_pendulum_ppo.pth")
+    torch.save(mlp_model.state_dict(), "models/inverted_pendulum_ppo.pth")
+    print("Saved best model weights to models/inverted_pendulum_ppo.pth")
+
+
+def load_best_policy(env):
+    # transform the policy to include the environment's preprocessing transforms
+    # this allows to export a single module that takes raw observations as input
+    # and outputs actions directly, without needing to apply the transforms separately
+
+    # get normalization constants from the environment's observation normalization transform
+    norm_loc, norm_scale = env.transform[0].loc.clone(), env.transform[0].scale.clone()
+    print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
+
+    # create a new observation normalization transform using the constants
+    norm_float32_module = TensorDictModule(
+        module=ObsNormFloat32(loc=norm_loc, scale=norm_scale),
+        in_keys=["observation"],
+        out_keys=["obs_float"]
+    )
+    
+    # load model weights as state_dict from file
+    actor_policy_state_dict = torch.load("models/inverted_pendulum_ppo.pth", map_location=device)
+    actor_network = create_actor_network(env)
+    
+    # load saved model weights into the actor network
+    actor_network.load_state_dict(actor_policy_state_dict)
+    
+    # setup the probabilistic actor policy from the loaded network
+    probabilistic_actor_policy = setup_policy(env, actor_network)
+
+    # create tensordict from normalization and conversion trasform
+    policy_tensordictseq = TensorDictSequential(
+        norm_float32_module,
+        # probabilistic actor policy trained to be exported
+        probabilistic_actor_policy.requires_grad_(False),
+    )
+    policy_tensordictseq.select_out_keys("action")
+    print("Policy transform input keys:", policy_tensordictseq.in_keys)
+    print("Policy transform output keys:", policy_tensordictseq.out_keys)
+    return policy_tensordictseq
 
 ######################################################################
 # Training loop
@@ -484,7 +520,12 @@ def training_loop(env, probabilistic_actor_policy, value_module, replay_buffer, 
     advantage_module, loss_module, optimizer, scheduler = setup_learning_modules(
         env, probabilistic_actor_policy, value_module)
 
+    # enable gradients for the policy network training
     probabilistic_actor_policy.requires_grad_(True)
+    
+    # track the best cumulative reward during evaluation
+    best_cum_reward = -float("inf")
+    
     # iteration over the collector allows to get batches of data from the environment
     for i, tensordict_data in enumerate(collector):
         # iterate for a number of epochs for each batch of data collected
@@ -505,20 +546,67 @@ def training_loop(env, probabilistic_actor_policy, value_module, replay_buffer, 
         current_lr = optimizer.param_groups[0]["lr"]
         log_stats(i, tensordict_data, current_lr)
 
-        # policy evaluation every 10 batches of data collected
-        if i >= 10 and i % 10 == 0:
-            eval_policy(i, env, probabilistic_actor_policy)
+        # policy evaluation every 5 batches of data collected
+        if i >= 10 and i % 5 == 0:
+            # evaluation rollout: run the policy in deterministic mode with pure exploitation
+            # exploit: take the expected value of the action distribution for a given
+            # number of steps
+            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+                # evaluate the policy multiple times to reduce variance
+                for k in range(3):
+                    # execute a rollout with the trained policy for max_steps
+                    eval_rollout = env.rollout(max_steps, policy=probabilistic_actor_policy)
+                    
+                    log_eval_stats(k, eval_rollout)
+                    current_cum_reward = eval_rollout["next", "reward"].sum().item()
+                    
+                    # if the current cumulative reward is better than the best so far, the model has improved
+                    # therefore, save the model weights as a checkpoint
+                    if current_cum_reward >= best_cum_reward:
+                        save_model_weights(probabilistic_actor_policy)
+                        best_cum_reward = current_cum_reward
+                        
+                    del eval_rollout # free memory
 
         # update the learning rate according to the scheduler after each batch
         scheduler.step()
 
+def run_inference(env, trained_actor_policy, episodes=5):
+    
+    # set evaluation mode for inference
+    trained_actor_policy.eval()
+
+    # run inference with the trained policy for a number of episodes
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        # run multiple episodes of inference with max_steps per episode
+        for episode in range(episodes):
+            # reset the environment at the start of each episode
+            tensordict = env.reset()
+            cum_reward = 0.0
+            step_count = 0
+
+            # automatic handling of the rollout with the trained policy
+            # it takes care of stepping through the environment until done
+            inference_rollout = env.rollout(
+                max_steps,
+                policy=trained_actor_policy,
+                auto_cast_to_device=True,
+            )
+            
+            # get statistics from the inference rollout
+            cum_reward += inference_rollout["next", "reward"].sum().item()
+            step_count += inference_rollout["step_count"].max().item()
+
+            print(f"Inference Episode {episode + 1}: Cumulative Reward = {cum_reward}, Steps = {step_count}")
 
 def main():
 
+    # initialize environment for training
     env = init_env()
     
     # create policy actor network and value critic network
-    probabilistic_actor_policy = setup_policy(env)
+    actor_network = create_actor_network(env)
+    probabilistic_actor_policy = setup_policy(env, actor_network)
     value_module = setup_value_module(env)
 
     # print("Running policy actor module:", probabilistic_actor_policy(env.reset()))
@@ -536,12 +624,18 @@ def main():
 
     # setup learning modules, then run the training loop
     training_loop(env, probabilistic_actor_policy, value_module, replay_buffer, collector)
-
-    # final evaluation after training is complete
-    eval_policy(-1, env, probabilistic_actor_policy)
+    
+    # load best policy from saved model weights
+    trained_actor_policy = load_best_policy(env)
 
     # save model program
-    export_policy(env, probabilistic_actor_policy)
+    export_policy(env, trained_actor_policy)
+    
+    # create environment with rendering enabled for inference
+    render_env = setup_env_rendered()
+    
+    # run inference with the trained policy for a number of episodes
+    run_inference(render_env, trained_actor_policy, episodes=10)
 
 
 if __name__ == "__main__":
