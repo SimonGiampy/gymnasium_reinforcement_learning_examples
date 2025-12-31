@@ -31,8 +31,9 @@ from tensordict.nn.distributions import NormalParamExtractor
 from torch import nn
 
 # torchrl imports
-from torchrl.envs import EnvBase # Gymnasium environment wrapper
-from torchrl.collectors import SyncDataCollector
+from torchrl.envs import EnvBase # Base environment wrapper
+from torchrl.envs import ParallelEnv # Parallel environment wrapper
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
@@ -43,7 +44,7 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
-from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type, step_mdp
+from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
@@ -136,7 +137,7 @@ def setup_env_normalized(base_env: EnvBase):
 
     # initialize mu, sigma for parent environment's observation spec
     norm_transform.init_stats(num_iter=MAX_STEPS,  # number of iterations to run for normalization statistics computation
-                              reduce_dim=0, cat_dim=0)  # dimension axis to reduce and concatenate on (batch axis)
+                              reduce_dim=0, cat_dim=0)  # dimension axis to reduce and concatenate on (data axis)
 
     print("normalization constant shape:", norm_transform.loc.shape)
     print("observation_spec:", env.observation_spec["observation"])
@@ -167,6 +168,48 @@ def setup_env(base_env: EnvBase):
 
     return env
 
+def setup_parallel_env(base_env: EnvBase, num_envs: int):
+    
+    parallel_env = ParallelEnv(
+        num_workers=num_envs,
+        create_env_fn=lambda: base_env
+    )
+    
+    # apply a set of transforms to the base environment to:
+    # - normalize observations
+    # - convert all double tensors to float tensors
+    # - add a step counter to keep track of episode lengths before termination
+    norm_transform = ObservationNorm(in_keys=["observation"], out_keys=["obs_norm"],
+                                     standard_normal=True, eps=NORM_EPS)
+
+    # create the transformed environment via a composition of transforms
+    env = TransformedEnv(
+        base_env=parallel_env,
+        transform=Compose(  # a sequence of transforms to apply
+            norm_transform,  # normalize observations
+            DoubleToFloat(in_keys=["obs_norm"], out_keys=["obs_float"]),  # convert all double tensors to float tensors
+            StepCounter(max_steps=MAX_STEPS),  # count the steps taken in each episode before termination
+        ),
+    )
+
+    # initialize mu, sigma for parent environment's observation spec
+    norm_transform.init_stats(num_iter=MAX_STEPS,  # number of iterations to run for normalization statistics computation
+                              reduce_dim=1, cat_dim=1)  # dimension axis to reduce and concatenate on (tensors axis)
+
+    print("normalization constant shape:", norm_transform.loc.shape)
+    print("observation_spec:", env.observation_spec["observation"])
+    print("reward_spec:", env.reward_spec)
+    print("action_spec:", env.action_spec)
+    observation_space_shape = env.observation_spec["observation"].shape
+    print("size of observation space:", observation_space_shape)
+    action_space_shape = env.action_spec.shape
+    print("size of action space:", action_space_shape)
+
+    # sanity check with a dummy rollout
+    check_env_specs(env)   
+
+    return env
+
 ######################################################################
 # Policy
 # ------
@@ -175,7 +218,7 @@ def setup_env(base_env: EnvBase):
 layer_neurons = 256  # number of neurons per linear layer
 depth = 3  # number of hidden layers in the MLP policy network
 
-def create_actor_network(env):
+def create_actor_network(env: EnvBase):
     observation_space_num = env.observation_spec["observation"].shape[-1]
     action_space_num = env.action_spec.shape[-1]
 
@@ -205,7 +248,7 @@ def create_actor_network(env):
     
     return actor_network
     
-def setup_policy(env, actor_network):
+def setup_policy(env: EnvBase, actor_network: nn.Module):
     
     # compute number of parameters in the policy network
     num_policy_params = sum(p.numel() for p in actor_network.parameters())
@@ -240,7 +283,7 @@ def setup_policy(env, actor_network):
 #
 
 
-def setup_value_module(env):
+def setup_value_module(env: EnvBase):
 
     observation_space_num = env.observation_spec["observation"].shape[-1]
     # define the value network architecture, similar to the policy network
@@ -274,7 +317,7 @@ def setup_value_module(env):
 # --------------
 #
 
-def create_collector(env: EnvBase, actor_policy):
+def create_collector(env: EnvBase, actor_policy: TensorDictModule):
     
     total_frames = 1024 * ITERATIONS
 
@@ -287,6 +330,26 @@ def create_collector(env: EnvBase, actor_policy):
         total_frames=total_frames,
         split_trajs=False,
         device=device,
+        storing_device=device,
+    )
+
+    return collector
+
+def create_multiprocess_collector(env: EnvBase, actor_policy: TensorDictModule, num_workers: int):
+    
+    total_frames = 1024 * ITERATIONS
+
+    # data collector to gather data from the environment using the current policy
+    # multiprocess collector: collects data in multiple parallel processes
+    collector = MultiSyncDataCollector(
+        create_env_fn=lambda: env,  # environment to collect data from
+        policy=actor_policy,  # current policy to use for data collection
+        frames_per_batch=frames_per_batch,
+        total_frames=total_frames,
+        split_trajs=False,
+        device=device,
+        storing_device=device,
+        num_workers=num_workers,
     )
 
     return collector
@@ -313,7 +376,7 @@ def create_replay_buffer():
 # -------------
 #
 
-def setup_learning_modules(env, probabilistic_actor_policy, value_module):
+def setup_learning_modules(probabilistic_actor_policy, value_module):
 
     # Generalized Advantage Estimation (GAE) module to compute advantage values
     advantage_module = GAE(
@@ -363,25 +426,25 @@ def setup_learning_modules(env, probabilistic_actor_policy, value_module):
 # -----------------
 
 
-def log_stats(batch_i, tensordict_data, lr):
+def log_stats(batch_i: int, tensordict_data, lr):
     train_reward = tensordict_data["next", "reward"].mean().item()
     steps = tensordict_data["step_count"].max().item()
     current_lr = lr
 
-    cum_reward_str = f" average reward={train_reward: 4.4f}"
+    cum_reward_str = f" average reward={train_reward:.3f}"
     stepcount_str = f" max step-count={steps}"
-    lr_str = f" lr={current_lr: 4.4f}"
+    lr_str = f" lr={current_lr:.2e}" # scientific notation
 
     print(f"epoch {batch_i}:" + cum_reward_str + "," + stepcount_str + "," + lr_str)
 
 
-def log_eval_stats(batch_i, eval_rollout):
+def log_eval_stats(batch_i: int, eval_rollout):
     eval_reward_mean = eval_rollout["next", "reward"].mean().item()
     eval_reward_sum = eval_rollout["next", "reward"].sum().item()
     steps = eval_rollout["step_count"].max().item()
 
-    mean_reward_str = f" eval mean reward={eval_reward_mean: 4.4f}"
-    cum_reward_str = f" eval cum reward={eval_reward_sum: 4.4f}"
+    mean_reward_str = f" eval mean reward={eval_reward_mean:.3f}"
+    cum_reward_str = f" eval cum reward={eval_reward_sum:.3f}"
     stepcount_str = f" eval max step-count={steps}"
 
     print(f"eval epoch {batch_i}:" + mean_reward_str + "," + cum_reward_str + "," + stepcount_str)
@@ -420,7 +483,7 @@ def train_sub_batch(replay_buffer, loss_module, optimizer):
         optimizer.zero_grad()  # reset gradients for the next step
 
 
-def eval_policy(batch_i, env, probabilistic_actor_policy):
+def eval_policy(batch_i: int, env, probabilistic_actor_policy):
     # evaluation rollout: run the policy in deterministic mode with pure exploitation
     # exploit: take the expected value of the action distribution for a given
     # number of steps
@@ -435,13 +498,18 @@ def eval_policy(batch_i, env, probabilistic_actor_policy):
 # Exporting and Saving the trained policy for inference
 # -----------------------------------------------------
 
-def export_policy(env, actor_policy):
+def export_policy(env: EnvBase, actor_policy, model_filepath: str):
     
     # if the policy improved during evaluation, save the policy network module
 
     # generate fake tensordict = input data
     fake_td = env.base_env.fake_tensordict()
     obs = fake_td["observation"].to(device)
+    
+    # remove extension to filepath and add .pt2 for exported module
+    if not model_filepath.endswith(".pt2"):
+        model_filepath = model_filepath[:-4]
+        model_filepath += ".pt2"
 
     # pure exploitation policy when exporting module program
     # exploitation will take maximum value of mean probabilities
@@ -459,26 +527,23 @@ def export_policy(env, actor_policy):
         print("Exported module output with fake observation input:", output)
 
         # save the exported policy module to a file
-        torch.export.save(exported_policy, "models/inverted_pendulum_ppo_policy.pt2")
+        torch.export.save(exported_policy, model_filepath)
 
 
-def save_model_weights(probabilistic_actor_policy):
+def save_model_weights(probabilistic_actor_policy, model_filepath: str = "models/model.pth"):
     # save the model weights of the deep MLP model used as policy network
     mlp_model = probabilistic_actor_policy.module[0].module
     
     # save model weights only with state_dict
-    torch.save(mlp_model.state_dict(), "models/inverted_pendulum_ppo.pth")
-    print("Saved best model weights to models/inverted_pendulum_ppo.pth")
+    torch.save(mlp_model.state_dict(), model_filepath)
+    print("Saved best model weights to file:", model_filepath)
 
-
-def load_best_policy(env):
+def load_policy_norm(env: EnvBase, norm_loc: torch.Tensor, norm_scale: torch.Tensor, 
+                     model_filepath: str = "models/model.pth"):
+    
     # transform the policy to include the environment's preprocessing transforms
     # this allows to export a single module that takes raw observations as input
     # and outputs actions directly, without needing to apply the transforms separately
-
-    # get normalization constants from the environment's observation normalization transform
-    norm_loc, norm_scale = env.transform[0].loc.clone(), env.transform[0].scale.clone()
-    # print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
 
     # create a new observation normalization transform using the constants
     norm_float32_module = TensorDictModule(
@@ -488,7 +553,7 @@ def load_best_policy(env):
     )
     
     # load model weights as state_dict from file
-    actor_policy_state_dict = torch.load("models/inverted_pendulum_ppo.pth", map_location=device)
+    actor_policy_state_dict = torch.load(model_filepath, map_location=device)
     actor_network = create_actor_network(env)
     
     # load saved model weights into the actor network
@@ -508,16 +573,24 @@ def load_best_policy(env):
     print("Policy transform output keys:", policy_tensordictseq.out_keys)
     return policy_tensordictseq
 
+def load_policy(env: EnvBase, model_filepath: str = "models/model.pth"):
+    
+    # get normalization constants from the environment's observation normalization transform
+    norm_loc, norm_scale = env.transform[0].loc.clone(), env.transform[0].scale.clone()
+    # print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
+
+    return load_policy_norm(env, norm_loc, norm_scale, model_filepath=model_filepath)
+
 ######################################################################
 # Training loop
 # -------------
 
 
-def training_loop(env, probabilistic_actor_policy, value_module, replay_buffer, collector):
+def training_loop(env, probabilistic_actor_policy, value_module, replay_buffer, collector, model_filepath):
 
     # setup learning modules: advantage estimator, loss function, optimizer, scheduler
     advantage_module, loss_module, optimizer, scheduler = setup_learning_modules(
-        env, probabilistic_actor_policy, value_module)
+        probabilistic_actor_policy, value_module)
 
     # enable gradients for the policy network training
     probabilistic_actor_policy.requires_grad_(True)
@@ -546,7 +619,7 @@ def training_loop(env, probabilistic_actor_policy, value_module, replay_buffer, 
         log_stats(i, tensordict_data, current_lr)
 
         # policy evaluation every 5 batches of data collected
-        if i >= 10 and i % 5 == 0:
+        if (i+1) >= 10 and (i+1) % 5 == 0:
             # evaluation rollout: run the policy in deterministic mode with pure exploitation
             # exploit: take the expected value of the action distribution for a given
             # number of steps
@@ -562,7 +635,7 @@ def training_loop(env, probabilistic_actor_policy, value_module, replay_buffer, 
                     # if the current cumulative reward is better than the best so far, the model has improved
                     # therefore, save the model weights as a checkpoint
                     if current_cum_reward >= best_cum_reward:
-                        save_model_weights(probabilistic_actor_policy)
+                        save_model_weights(probabilistic_actor_policy, model_filepath)
                         best_cum_reward = current_cum_reward
                         
                     del eval_rollout # free memory
