@@ -1,0 +1,74 @@
+# import local script with all functions
+import mujoco_ppo as mj_ppo
+
+# import Gymnasium environment wrapper
+from torchrl.envs.libs.gym import GymEnv
+from torchrl.envs.libs.gym import set_gym_backend
+
+# Humanoid environment:
+# https://gymnasium.farama.org/environments/mujoco/humanoid/
+env_name = "Humanoid-v5"
+
+num_envs = 16  # number of parallel environments for training
+
+
+def main():
+
+    print("list of available Gymnasium environments:", GymEnv.available_envs)
+
+    # initialize environment for training
+    with set_gym_backend("gymnasium"):
+        base_env = GymEnv(env_name, device=mj_ppo.device, render_mode=None)
+        print("Initialized base environment:", env_name)
+
+    mj_ppo.set_max_steps(1000)
+    mj_ppo.set_iterations(100)
+
+    parallel_env = mj_ppo.setup_parallel_env(base_env, num_envs)
+    print(f"Initialized parallel environment with {num_envs} workers.")
+
+    # get normalization constants from the environment's observation normalization transform
+    print("Parallel Env with transforms:", parallel_env.transform)
+    norm_loc, norm_scale = parallel_env.transform[0].loc.clone(), parallel_env.transform[0].scale.clone()
+    # extract normalization constants of batch 0
+    norm_loc = norm_loc[0]
+    norm_scale = norm_scale[0]
+    # print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
+
+    # create policy actor network and value critic network
+    actor_network = mj_ppo.create_actor_network(parallel_env)
+    probabilistic_actor_policy = mj_ppo.setup_policy(parallel_env, actor_network)
+    value_module = mj_ppo.setup_value_module(parallel_env)
+
+    # print("Running policy actor module:", probabilistic_actor_policy(parallel_env.reset()))
+    # print("Running value critic module:", value_module(parallel_env.reset()))
+
+    # setup of replay buffer, collector
+    collector = mj_ppo.create_collector(parallel_env, probabilistic_actor_policy)
+    replay_buffer = mj_ppo.create_replay_buffer()
+
+    # setup learning modules, then run the training loop
+    mj_ppo.training_loop(parallel_env, probabilistic_actor_policy, value_module,
+                         replay_buffer, collector, model_filepath="models/humanoid_ppo.pth")
+    
+    parallel_env.close()
+    
+    # initialize the base environment with rendering enabled
+    base_env = GymEnv(env_name, device=mj_ppo.device, render_mode="human")
+    print("Initialized rendered environment:", env_name)
+
+    # create environment with rendering enabled for inference
+    render_env = mj_ppo.setup_env(base_env)
+
+    # load best policy from saved model weights
+    trained_actor_policy = mj_ppo.load_policy_norm(env=render_env, norm_loc=norm_loc, norm_scale=norm_scale,
+                                                   model_filepath="models/humanoid_ppo.pth")
+    
+    # run inference with the trained policy for a number of episodes
+    mj_ppo.run_inference(render_env, trained_actor_policy, episodes=10)
+
+    render_env.close()
+
+
+if __name__ == "__main__":
+    main()
