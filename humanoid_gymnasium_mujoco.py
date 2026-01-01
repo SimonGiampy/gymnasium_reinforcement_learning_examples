@@ -18,11 +18,21 @@ def main():
 
     # initialize environment for training
     with set_gym_backend("gymnasium"):
-        base_env = GymEnv(env_name, device=mj_ppo.device, render_mode=None)
+        base_env = GymEnv(env_name, device=mj_ppo.device, render_mode=None,
+                          forward_reward_weight=3.0, # default = 1.25
+                          healthy_reward=2.0, # default = 5.0
+                          terminate_when_unhealthy=True)
         print("Initialized base environment:", env_name)
 
     mj_ppo.set_max_steps(1000)
-    mj_ppo.set_iterations(100)
+    frames_per_batch = 1024 * num_envs
+    total_frames = frames_per_batch * 100  # total frames for training
+    mj_ppo.set_frames_iterations(
+        frames_per_batch=frames_per_batch,
+        total_frames=total_frames,
+        iterations=100,
+        sub_batch_size=1024
+    )
 
     parallel_env = mj_ppo.setup_parallel_env(base_env, num_envs)
     print(f"Initialized parallel environment with {num_envs} workers.")
@@ -51,8 +61,6 @@ def main():
     mj_ppo.training_loop(parallel_env, probabilistic_actor_policy, value_module,
                          replay_buffer, collector, model_filepath="models/humanoid_ppo.pth")
     
-    parallel_env.close()
-    
     # initialize the base environment with rendering enabled
     base_env = GymEnv(env_name, device=mj_ppo.device, render_mode="human")
     print("Initialized rendered environment:", env_name)
@@ -67,6 +75,7 @@ def main():
     # run inference with the trained policy for a number of episodes
     mj_ppo.run_inference(render_env, trained_actor_policy, episodes=10)
 
+    # parallel_env.close()
     render_env.close()
 
 

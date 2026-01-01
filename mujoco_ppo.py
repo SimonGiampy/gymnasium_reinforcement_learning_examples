@@ -63,27 +63,26 @@ print("Using device:", device)
 
 # PPO-clip parameters
 MAX_STEPS = 1000  # max steps per episode
-SUB_BATCH_SIZE = 128  # cardinality of the sub-samples gathered from the current data in the inner loop
+SUB_BATCH_SIZE = 1024  # cardinality of the sub-samples gathered from the current data in the inner loop
 NUM_EPOCHS = 10  # optimization steps per batch of data collected
-CLIP_EPSILON = (
-    0.2  # clip value for PPO loss: see the equation in the intro for more context.
-)
+CLIP_EPSILON = 0.2  # clip value for PPO loss: see the equation in the intro for more context.
 GAMMA = 0.99
-LAMBDA = 0.95
-ENTROPY_EPS = 1e-4
+LAMBDA = 0.90
+ENTROPY_EPS = 1e-2  # entropy bonus coefficient
 NORM_EPS = 1e-6 # observation norm scale epsilon
 
 # Data collection parameters
 
 # frames per batch = number of environment steps per data collection batch
-frames_per_batch = 1024
+FRAMES_PER_BATCH = 1024*16
 
 # total frames = total number of environment steps for the whole training
 ITERATIONS = 100
-total_frames = frames_per_batch * ITERATIONS
+TOTAL_FRAMES = FRAMES_PER_BATCH * ITERATIONS
 
 # optimizer parameters
-lr = 5e-4  # starting learning rate for the optimizer
+max_lr = 5e-4  # starting learning rate for the optimizer
+min_lr = 1e-5  # minimum learning rate for the scheduler
 max_grad_norm = 1.0
 
 
@@ -91,9 +90,15 @@ def set_max_steps(max_steps: int):
     global MAX_STEPS
     MAX_STEPS = max_steps
 
-def set_iterations(iterations: int):
+def set_frames_iterations(frames_per_batch: int, total_frames: int, iterations: int, sub_batch_size: int):
+    global FRAMES_PER_BATCH
+    FRAMES_PER_BATCH = frames_per_batch
+    global TOTAL_FRAMES
+    TOTAL_FRAMES = total_frames
     global ITERATIONS
     ITERATIONS = iterations
+    global SUB_BATCH_SIZE
+    SUB_BATCH_SIZE = sub_batch_size
 
 ######################################################################
 # Environment definition: use Gymnasium's InvertedDoublePendulum-v5
@@ -193,7 +198,7 @@ def setup_parallel_env(base_env: EnvBase, num_envs: int):
     )
 
     # initialize mu, sigma for parent environment's observation spec
-    norm_transform.init_stats(num_iter=MAX_STEPS,  # number of iterations to run for normalization statistics computation
+    norm_transform.init_stats(num_iter=10*MAX_STEPS,  # number of iterations to run for normalization statistics computation
                               reduce_dim=1, cat_dim=1)  # dimension axis to reduce and concatenate on (tensors axis)
 
     print("normalization constant shape:", norm_transform.loc.shape)
@@ -216,7 +221,7 @@ def setup_parallel_env(base_env: EnvBase, num_envs: int):
 #
 
 layer_neurons = 256  # number of neurons per linear layer
-depth = 3  # number of hidden layers in the MLP policy network
+depth = 4  # number of hidden layers in the MLP policy network
 
 def create_actor_network(env: EnvBase):
     observation_space_num = env.observation_spec["observation"].shape[-1]
@@ -318,16 +323,14 @@ def setup_value_module(env: EnvBase):
 #
 
 def create_collector(env: EnvBase, actor_policy: TensorDictModule):
-    
-    total_frames = 1024 * ITERATIONS
 
     # data collector to gather data from the environment using the current policy
     # synchronous collector: collects data in the main thread
     collector = SyncDataCollector(
         create_env_fn=env,  # environment to collect data from
         policy=actor_policy,  # current policy to use for data collection
-        frames_per_batch=frames_per_batch,
-        total_frames=total_frames,
+        frames_per_batch=FRAMES_PER_BATCH,
+        total_frames=TOTAL_FRAMES,
         split_trajs=False,
         device=device,
         storing_device=device,
@@ -336,16 +339,14 @@ def create_collector(env: EnvBase, actor_policy: TensorDictModule):
     return collector
 
 def create_multiprocess_collector(env: EnvBase, actor_policy: TensorDictModule, num_workers: int):
-    
-    total_frames = 1024 * ITERATIONS
 
     # data collector to gather data from the environment using the current policy
     # multiprocess collector: collects data in multiple parallel processes
     collector = MultiSyncDataCollector(
         create_env_fn=lambda: env,  # environment to collect data from
         policy=actor_policy,  # current policy to use for data collection
-        frames_per_batch=frames_per_batch,
-        total_frames=total_frames,
+        frames_per_batch=FRAMES_PER_BATCH,
+        total_frames=TOTAL_FRAMES,
         split_trajs=False,
         device=device,
         storing_device=device,
@@ -366,7 +367,7 @@ def create_replay_buffer():
     # replay buffer to store collected data for training
     # random sampling without replacement from the collected batch of data
     replay_buffer = ReplayBuffer(
-        storage=LazyTensorStorage(max_size=frames_per_batch),
+        storage=LazyTensorStorage(max_size=FRAMES_PER_BATCH),
         sampler=SamplerWithoutReplacement(),
     )
     return replay_buffer
@@ -401,13 +402,13 @@ def setup_learning_modules(probabilistic_actor_policy, value_module):
 
     optimizer = torch.optim.Adam(
         params=loss_module.parameters(),
-        lr=lr
+        lr=max_lr,  # initial learning rate
     )
     
     # compute the number of batches for the collector
-    max_scheduler_steps = total_frames // frames_per_batch
+    max_scheduler_steps = TOTAL_FRAMES // FRAMES_PER_BATCH
     print("Total batches of data sampled from the collector:", max_scheduler_steps)
-    sub_batch_frames = frames_per_batch // SUB_BATCH_SIZE
+    sub_batch_frames = FRAMES_PER_BATCH // SUB_BATCH_SIZE
     print("Number of sub-batches per batch of data collected:", sub_batch_frames)
 
     # learning rate scheduler: cosine annealing over the total number of frames
@@ -416,7 +417,7 @@ def setup_learning_modules(probabilistic_actor_policy, value_module):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer=optimizer,
         T_max=max_scheduler_steps,  # number of steps for a full cosine annealing cycle
-        eta_min=1e-5  # minimum learning rate at the end of training
+        eta_min=min_lr  # minimum learning rate at the end of training
     )
 
     return advantage_module, loss_module, optimizer, scheduler
@@ -455,7 +456,7 @@ def log_eval_stats(batch_i: int, eval_rollout):
 
 
 def train_sub_batch(replay_buffer, loss_module, optimizer):
-    sub_batch_frames = frames_per_batch // SUB_BATCH_SIZE
+    sub_batch_frames = FRAMES_PER_BATCH // SUB_BATCH_SIZE
 
     # inner loop: iterate over sub-batches sampled from the replay buffer
     for _ in range(sub_batch_frames):
