@@ -3,7 +3,7 @@ import sys
 
 # import local script with all functions
 import mujoco_ppo as mj_ppo
-from deepmind_env_setup import setup_env
+from deepmind_env_setup import setup_env_training, setup_env_inference, setup_inference_transforms, run_inference_rendered
 import deepmind_env_setup
 
 # import Gymnasium environment wrapper
@@ -36,8 +36,8 @@ def training():
     # setting training hyperparameters
     mj_ppo.set_max_steps(deepmind_env_setup.MAX_STEPS)
     
-    iterations = 10
-    sub_batch_size = 256
+    iterations = 100
+    sub_batch_size = 2048
     frames_per_batch = sub_batch_size * 8
     total_frames = frames_per_batch * iterations  # total frames for training
     mj_ppo.set_frames_iterations(
@@ -50,16 +50,8 @@ def training():
     # learning rate scheduler parameters
     mj_ppo.set_lr(min_learning_rate=1e-5, max_learning_rate=5e-4)
 
-    env = setup_env(base_env, num_envs)
+    env = setup_env_training(base_env, num_envs)
     print(f"Initialized parallel environment with {num_envs} workers.")
-
-    # get normalization constants from the environment's observation normalization transform
-    print("Parallel Env with transforms:", env.transform)
-    norm_loc, norm_scale = env.transform[1].loc.clone(), env.transform[1].scale.clone()
-    # extract normalization constants of batch 0
-    #norm_loc = norm_loc[0]
-    #norm_scale = norm_scale[0]
-    print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
 
     # create policy actor network and value critic network
     actor_network = mj_ppo.create_actor_network(env)
@@ -77,16 +69,19 @@ def training():
     mj_ppo.training_loop(env, probabilistic_actor_policy, value_module,
                          replay_buffer, collector, model_filepath=model_file_name + ".pth")
     
-    # load best policy from saved model weights
-    trained_actor_policy = mj_ppo.load_policy_norm(env=base_env, norm_loc=norm_loc, norm_scale=norm_scale,
-                                                   model_filepath=model_file_name + ".pth")
+    # observation normalization + double to float transforms for inference
+    transform = setup_inference_transforms(env=env)
     
-    # save model program
-    mj_ppo.export_policy(env=base_env, actor_policy=trained_actor_policy,
-                         model_filepath=model_file_name + ".pt2")
+    # load best policy from saved model weights
+    env_inference = setup_env_inference(base_env)
+    trained_actor_policy = mj_ppo.load_policy_transform(env_inference, transform, 
+                                                        model_filepath=model_file_name + ".pth")
 
-    # run inference with the trained policy for a number of episodes
-    mj_ppo.run_inference(base_env, trained_actor_policy, episodes=10)
+    # save model program
+    mj_ppo.export_policy(env=env_inference, actor_policy=trained_actor_policy,
+                         model_filepath=model_file_name + ".pt2")
+    
+    run_inference_rendered(env_inference, trained_actor_policy)
 
     # parallel_env.close()
     env.close()
