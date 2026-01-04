@@ -8,12 +8,16 @@ from torchrl.envs import (
     TransformedEnv,
 )
 from torchrl.envs.utils import check_env_specs
+from tensordict.nn import TensorDictModule, TensorDictSequential
+
+# local imports
+from mujoco_ppo import ObsNormFloat32, load_policy_transform
 
 NORM_EPS = 1e-6  # observation norm scale epsilon
 MAX_STEPS = 1000  # max steps per episode before termination
 
 
-def setup_env(base_env: EnvBase):
+def setup_env_training(base_env: EnvBase):
 
     # apply a set of transforms to the base environment to:
     # - normalize observations
@@ -51,7 +55,7 @@ def setup_env(base_env: EnvBase):
     return env
 
 
-def setup_base_env(base_env: EnvBase):
+def setup_env_inference(base_env: EnvBase):
 
     # create the transformed environment via a composition of transforms
     env = TransformedEnv(
@@ -108,3 +112,26 @@ def setup_parallel_env(base_env: EnvBase, num_envs: int):
     check_env_specs(env)
 
     return env
+
+
+def setup_inference_transforms(env: EnvBase):
+    # transform the policy to include the environment's preprocessing transforms
+    # this allows to export a single module that takes raw observations as input
+    # and outputs actions directly, without needing to apply the transforms separately
+
+    # get normalization constants from the environment's observation normalization transform
+    norm_loc, norm_scale = env.transform[0].loc.clone(), env.transform[0].scale.clone()
+    # if loc and scale have shape [num_envs, obs_dim], extract normalization constants of batch 0
+    if len(norm_loc.shape) > 1:
+        norm_loc = norm_loc[0]
+        norm_scale = norm_scale[0]
+    # print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
+    
+    # create a new observation normalization transform using the constants
+    norm_float32_module = TensorDictModule(
+        module=ObsNormFloat32(loc=norm_loc, scale=norm_scale), 
+        in_keys=["observation"],
+        out_keys=["obs_float"]
+    )
+
+    return norm_float32_module

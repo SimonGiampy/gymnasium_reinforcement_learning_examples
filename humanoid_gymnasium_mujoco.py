@@ -3,7 +3,7 @@ import sys
 
 # import local script with all functions
 import mujoco_ppo as mj_ppo
-from gymnasium_env_setup import setup_base_env, setup_env, setup_parallel_env
+from gymnasium_env_setup import setup_inference_transforms, setup_env_inference, setup_parallel_env
 import gymnasium_env_setup
 
 # import Gymnasium environment wrapper
@@ -34,7 +34,7 @@ def training():
     # setting training hyperparameters
     mj_ppo.set_max_steps(gymnasium_env_setup.MAX_STEPS)
     
-    iterations = 100
+    iterations = 10
     sub_batch_size = 2048
     frames_per_batch = sub_batch_size * 8
     total_frames = frames_per_batch * iterations  # total frames for training
@@ -51,14 +51,6 @@ def training():
     # setup parallel environment for training with multiple environments
     parallel_env = setup_parallel_env(base_env, num_envs)
     print(f"Initialized parallel environment with {num_envs} workers.")
-
-    # get normalization constants from the environment's observation normalization transform
-    print("Parallel Env with transforms:", parallel_env.transform)
-    norm_loc, norm_scale = parallel_env.transform[0].loc.clone(), parallel_env.transform[0].scale.clone()
-    # extract normalization constants of batch 0
-    norm_loc = norm_loc[0]
-    norm_scale = norm_scale[0]
-    # print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
 
     # create policy actor network and value critic network
     actor_network = mj_ppo.create_actor_network(parallel_env)
@@ -79,13 +71,15 @@ def training():
     # initialize the base environment with rendering enabled
     base_env = GymEnv(env_name, device=mj_ppo.device, render_mode="human")
     print("Initialized rendered environment:", env_name)
+    
+    norm_float32_module = setup_inference_transforms(env=parallel_env)
 
     # create environment with rendering enabled for inference
-    render_env = setup_base_env(base_env)
+    render_env = setup_env_inference(base_env)
 
     # load best policy from saved model weights
-    trained_actor_policy = mj_ppo.load_policy_norm(env=render_env, norm_loc=norm_loc, norm_scale=norm_scale,
-                                                   model_filepath=model_filename + ".pth")
+    trained_actor_policy = mj_ppo.load_policy_transform(env=render_env, transform_module=norm_float32_module,
+                                                        model_filepath=model_filename + ".pth")
     
     # save model program
     mj_ppo.export_policy(env=render_env, actor_policy=trained_actor_policy,
