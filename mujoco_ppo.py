@@ -136,12 +136,10 @@ class ObsNormFloat32(nn.Module):
         return obs_norm.to(torch.float32)
 
 
-
 ######################################################################
 # Policy
 # ------
 #
-
 
 layer_neurons = 256  # number of neurons per linear layer
 depth = 4  # number of hidden layers in the MLP policy network
@@ -428,12 +426,12 @@ def eval_policy(batch_i: int, env, probabilistic_actor_policy):
 # Exporting and Saving the trained policy for inference
 # -----------------------------------------------------
 
-def export_policy(env: EnvBase, actor_policy, model_filepath: str):
+def export_policy(env: EnvBase, actor_policy: TensorDictSequential, model_filepath: str):
 
     # if the policy improved during evaluation, save the policy network module
 
     # generate fake tensordict = input data
-    fake_td = env.base_env.fake_tensordict()
+    fake_td = env.fake_tensordict()
     obs = fake_td["observation"].to(device)
 
     # remove extension to filepath and add .pt2 for exported module
@@ -469,19 +467,8 @@ def save_model_weights(probabilistic_actor_policy, model_filepath: str = "models
     print("Saved best model weights to file:", model_filepath)
 
 
-def load_policy_norm(env: EnvBase, norm_loc: torch.Tensor, norm_scale: torch.Tensor,
-                     model_filepath: str = "models/model.pth"):
-
-    # transform the policy to include the environment's preprocessing transforms
-    # this allows to export a single module that takes raw observations as input
-    # and outputs actions directly, without needing to apply the transforms separately
-
-    # create a new observation normalization transform using the constants
-    norm_float32_module = TensorDictModule(
-        module=ObsNormFloat32(loc=norm_loc, scale=norm_scale),
-        in_keys=["observation"],
-        out_keys=["obs_float"]
-    )
+def load_policy_transform(env: EnvBase, transform_module: TensorDictModule,
+                          model_filepath: str = "models/model.pth"):
 
     # load model weights as state_dict from file
     actor_policy_state_dict = torch.load(model_filepath, map_location=device)
@@ -493,9 +480,9 @@ def load_policy_norm(env: EnvBase, norm_loc: torch.Tensor, norm_scale: torch.Ten
     # setup the probabilistic actor policy from the loaded network
     probabilistic_actor_policy = setup_policy(env, actor_network)
 
-    # create tensordict from normalization and conversion trasform
+    # create tensordict from normalization and conversion transform
     policy_tensordictseq = TensorDictSequential(
-        norm_float32_module,
+        transform_module,
         # probabilistic actor policy trained to be exported
         probabilistic_actor_policy.requires_grad_(False),
     )
@@ -504,14 +491,6 @@ def load_policy_norm(env: EnvBase, norm_loc: torch.Tensor, norm_scale: torch.Ten
     print("Policy transform output keys:", policy_tensordictseq.out_keys)
     return policy_tensordictseq
 
-
-def load_policy(env: EnvBase, model_filepath: str = "models/model.pth"):
-
-    # get normalization constants from the environment's observation normalization transform
-    norm_loc, norm_scale = env.transform[0].loc.clone(), env.transform[0].scale.clone()
-    # print("Loaded observation normalization: loc = ", norm_loc, "; scale = ", norm_scale)
-
-    return load_policy_norm(env, norm_loc, norm_scale, model_filepath=model_filepath)
 
 ######################################################################
 # Training loop
@@ -606,6 +585,7 @@ def run_inference(env: EnvBase, trained_actor_policy: TensorDictModule, episodes
             print(f"Inference Episode {episode + 1}: mean reward = {mean_reward:.3f}, "
                   f"cumulative reward = {cum_reward:.3f}, steps = {steps}")
 
+
 class ExportedPolicyModule(torch.nn.Module):
     def __init__(self, policy: torch.fx.GraphModule):
         super().__init__()
@@ -614,6 +594,7 @@ class ExportedPolicyModule(torch.nn.Module):
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
         # forward method to process observations and return actions
         return self.policy(observation=observation)
+
 
 def run_inference_exported_model(env: EnvBase, model_filepath: str, episodes=5):
 
