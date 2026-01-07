@@ -2,9 +2,9 @@
 import sys
 
 # import local script with all functions
-import mujoco_ppo as mj_ppo
-from deepmind_env_setup import setup_env_training, setup_env_inference, setup_inference_transforms, run_inference_rendered
-import deepmind_env_setup
+from .mujoco_rl import mujoco_ppo as mj_ppo
+from .mujoco_rl.deepmind_env_setup import setup_env_training, setup_env_inference, setup_inference_transforms, run_inference_rendered
+from .mujoco_rl import deepmind_env_setup
 
 # import Gymnasium environment wrapper
 from torchrl.envs.libs.dm_control import DMControlEnv

@@ -1,7 +1,7 @@
 import sys
 
 # import local script with all functions
-import mujoco_ppo as mj_ppo
+from .mujoco_rl import mujoco_ppo as mj_ppo
 
 # import Gymnasium environment wrapper
 from torchrl.envs.libs.gym import GymEnv

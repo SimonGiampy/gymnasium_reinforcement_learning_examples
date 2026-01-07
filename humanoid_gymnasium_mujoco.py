@@ -2,9 +2,9 @@
 import sys
 
 # import local script with all functions
-import mujoco_ppo as mj_ppo
-from gymnasium_env_setup import setup_inference_transforms, setup_env_inference, setup_parallel_env
-import gymnasium_env_setup
+from .mujoco_rl import mujoco_ppo as mj_ppo
+from .mujoco_rl.gymnasium_env_setup import setup_inference_transforms, setup_env_inference, setup_parallel_env
+from .mujoco_rl import gymnasium_env_setup
 
 # import Gymnasium environment wrapper
 from torchrl.envs.libs.gym import GymEnv
