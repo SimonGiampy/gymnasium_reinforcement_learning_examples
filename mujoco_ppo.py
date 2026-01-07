@@ -1,9 +1,10 @@
 """
 Reinforcement Learning (PPO) with TorchRL Tutorial
 
-This tutorial demonstrates how to use PyTorch and `torchrl` to train a parametric policy
-network to solve the tasks from
-[OpenAI-Gym/Farama-Gymnasium control library](https://github.com/Farama-Foundation/Gymnasium).
+This script allows to use PyTorch and `torchrl` to train a parametric policy
+network to solve the tasks from:
+- DeepMind Control Suite: [DeepMind Control Suite](https://github.com/google-deepmind/dm_control)
+- Gymnasium: [OpenAI-Gym/Farama-Gymnasium library](https://github.com/Farama-Foundation/Gymnasium).
 
 Make sure you have the required packages installed:
 ```bash
@@ -37,13 +38,6 @@ from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.envs import (
-    Compose,
-    DoubleToFloat,
-    ObservationNorm,
-    StepCounter,
-    TransformedEnv,
-)
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal
 from torchrl.objectives import ClipPPOLoss
@@ -452,7 +446,7 @@ def export_policy(env: EnvBase, actor_policy: TensorDictSequential, model_filepa
         # print("Deterministic policy graph module: ", exported_policy.graph_module.print_readable())
 
         output = exported_policy.module()(observation=obs)
-        print("Exported module output with fake observation input:", output)
+        # print("Exported module output with fake observation input:", output)
 
         # save the exported policy module to a file
         torch.export.save(exported_policy, model_filepath)
